@@ -36,11 +36,11 @@ As barras de cota vêm do CLI, não de HTTP com token: `agy -p /usage --output-f
 
 No painel, a rota aparece conectada quando `agy models` responde — que é a prova de que o CLI está autenticado. O `status` devolve `cliManaged` (a conta é do CLI) e `cliActive` (o catálogo respondeu), além de uma linha de conta sintética `agy-cli`, porque as barras de cota são renderizadas por conta. Quando o CLI falha, a mensagem do erro vai em `detail` e aparece no cartão.
 
-Ferramentas do próprio CLI são bloqueadas na camada de política dele. O motor de permissões tem exatamente sete ações (`read_file`, `write_file`, `read_url`, `execute_url`, `download_url`, `command`, `mcp`) e **não** tem curinga global: uma regra não reconhecida — como um `*` sozinho — é ignorada em silêncio. Por isso as sete são negadas explicitamente em `--settings`, cada uma como `acao(*)`.
+Ferramentas do próprio CLI rodam com acesso total, por decisão explícita: a política em `--settings` é `{"permissions":{"allow":["*"]}}`, verificada ao vivo no `agy` 1.5.14 (leitura por caminho absoluto e por caminho relativo ao workspace, ambas respondendo o conteúdo do arquivo). O `*` sozinho é honrado nessa versão; se um `agy` futuro passar a ignorá-lo, as leituras voltam como recusas e o ponto de ajuste é a constante `ALLOW_RULES` em `lib/antigravity-cli-local.js`.
 
-Verificado ao vivo no `agy` 1.5.14 deste host, com essas regras: pedido para listar `C:\Windows` → `BLOCKED`; pedido para buscar uma URL imprevisível (`random.org` com `rnd=new`) → `BLOCKED`; pedido para rodar `echo hello` → `BLOCKED`; escrita fora do diretório da sessão não criou arquivo. O bloqueio acontece antes da execução.
+O CLI trabalha no diretório da sessão: o plugin resolve o workspace via `ctx.get("workingDirectory")` a partir do `sessionId` da chamada (`lib/index.js`, `resolveAgyWorkspace`), passa `--add-dir <workspace>` e usa esse diretório como `cwd`, de modo que caminhos relativos resolvem no repo. Sem `sessionId` (chamadas avulsas, testes), cai para o diretório temporário da chamada. O `settings.json` continua no temporário — nunca dentro do repo — e o `finally` apaga o temporário, nunca o workspace.
 
-Risco residual conhecido: ferramentas que não são recursos de permissão — por exemplo geração de imagem, subagentes, execução de notebook e agendamento — não são cobertas por nenhuma dessas sete regras, e não foram verificadas uma a uma.
+Aviso: isso executa fora do sandbox e da trilha de auditoria do DSH. O `agy` executa por conta própria e devolve só o texto final — nada aparece no transcript como `tool/call`. É um agente dentro do agente, não um modelo com as ferramentas do harnês. Use só em workspaces confiáveis. As rotas OpenAI/Claude continuam sendo a opção auditável (ferramentas executadas pelo DSH, evento por evento).
 
 A política de retry da rota é `maxRetries: 0` e sem códigos repetíveis: um 429 aparece como 429, sem laço de novas tentativas.
 

@@ -75,7 +75,7 @@ test('buildPrompt keeps tool-result text and still refuses a nested image', () =
 	] }), /text-only/u);
 });
 
-test('the CLI is always called with the tool-deny policy and the chosen variant', async () => {
+test('the CLI is always called with the full-access policy and the chosen variant', async () => {
 	const { spawn, calls } = fakeSpawn(({ stdout, child }) => {
 		// `--output-format stream-json` on 1.5.14: one event per line, last one wins.
 		stdout.end([
@@ -101,20 +101,32 @@ test('the CLI is always called with the tool-deny policy and the chosen variant'
 	const turn = JSON.parse(call.stdin.trim());
 	assert.equal(turn.event, 'user');
 	assert.deepEqual(turn.message.content, [{ type: 'text', text: 'hi' }]);
-	// The deny policy is a file (argv has a size cap), passed by path.
+	// The allow policy is a file (argv has a size cap), passed by path.
 	const settingsPath = call.args[call.args.indexOf('--settings') + 1];
 	assert.match(settingsPath, /settings\.json$/u);
-	const deny = call.settings;
-	// Every action the permission engine evaluates, or a tool is left ungated.
-	assert.deepEqual(deny.permissions.deny, [
-		'read_file(*)',
-		'write_file(*)',
-		'read_url(*)',
-		'execute_url(*)',
-		'download_url(*)',
-		'command(*)',
-		'mcp(*)'
-	]);
+	assert.deepEqual(call.settings, { permissions: { allow: ['*'] } });
+	// Without a workspace the CLI runs in its temp directory and adds nothing.
+	assert.ok(!call.args.includes('--add-dir'), 'no workspace, no --add-dir');
+	assert.ok(settingsPath.startsWith(call.options.cwd), 'policy lives next to the run cwd');
+	assert.match(settingsPath, /settings\.json$/u);
+});
+
+test('a session workspace becomes the CLI cwd and is registered with --add-dir', async () => {
+	const { spawn, calls } = fakeSpawn(({ stdout, child }) => {
+		stdout.end('{"event":"result","result":{"status":"SUCCESS","response":"ok"}}\n');
+		child.emit('close', 0);
+	});
+	const agy = createAgy({ spawn, bin: 'agy-under-test' });
+	await agy.run({ model: 'gemini-4-hydrogen-medium', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }], workspaceDir: 'D:\\Projetos\\SIG' });
+	const [call] = calls;
+	const at = call.args.indexOf('--add-dir');
+	assert.notEqual(at, -1);
+	assert.equal(call.args[at + 1], 'D:\\Projetos\\SIG');
+	assert.equal(call.options.cwd, 'D:\\Projetos\\SIG');
+	// The policy file still lives in the temp directory, not in the repo.
+	const settingsPath = call.args[call.args.indexOf('--settings') + 1];
+	assert.ok(!settingsPath.startsWith('D:\\Projetos\\SIG'), 'policy must not pollute the workspace');
+	assert.deepEqual(call.settings, { permissions: { allow: ['*'] } });
 });
 
 test('a prompt far past the Windows command-line cap is still delivered', async () => {
