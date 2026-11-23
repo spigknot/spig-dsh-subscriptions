@@ -12,6 +12,24 @@ O CLI usa a conta Google logada nele no computador que executa o Harness. Execut
 
 O catálogo é lido por `agy models`. Variantes de esforço aparecem agrupadas sob o mesmo modelo e o esforço seleciona uma variante exata do catálogo. A ponte inicial é de texto; não oferece execução de ferramentas do Harness nem processa anexos de imagem. Não é uma substituição da experiência completa do CLI em sessões de agente.
 
+## Transporte sem argumento grande
+
+O prompt **não** viaja em `argv`. No Windows a linha de comando tem teto de ~32 KB, e continuar uma sessão longa com `agy -p "<prompt>"` falhava com `spawn ENAMETOOLONG` antes de qualquer chamada ao modelo.
+
+A chamada agora é:
+
+```
+agy --input-format stream-json --output-format stream-json \
+    --model <variante> --settings <arquivo>
+```
+
+- O prompt vai por **stdin**, como um único turno NDJSON: `{"event":"user","message":{"role":"user","content":[{"type":"text","text":"..."}]}}`. O campo `event` é obrigatório — sem ele o CLI responde `stream input message is missing the "event" field`.
+- `-p='-'` **não** lê stdin: o CLI trata `-` como prompt literal vazio e abre uma conversa nova sem responder ao texto enviado. Por isso o modo print foi abandonado para o chat.
+- A política de negação vai em `settings.json` dentro do diretório temporário da chamada, apagado no `finally`, em vez de JSON inline em `argv`.
+- `--output-format stream-json` emite um evento por linha (`init`, `step_update`, `result`); o transporte usa o último `result`. `agy models` e `agy -p /usage` continuam no modo texto/JSON, que são pequenos.
+
+Verificado ao vivo em `agy` 1.5.14 neste host: prompt de ~64 KB (o dobro do teto do Windows) respondido corretamente, 41 s. A suíte cobre o caso grande em `test/antigravity-cli-local.test.mjs` ("a prompt far past the Windows command-line cap is still delivered"), exigindo `argv` abaixo de 8 KB e o texto inteiro no stdin.
+
 Cada modelo resolve `context.contextWindow` = 1.048.576 e `defaultMaxTokens` = 32.768. Sem a janela de contexto, a compactação recusa qualquer troca de modelo no meio de uma sessão com `MODEL_SWITCH_COMPACTION_FAILED`.
 
 As barras de cota vêm do CLI, não de HTTP com token: `agy -p /usage --output-format json` devolve os buckets com `remaining_fraction`, janela (`weekly`/`5h`) e `reset_time`. O plugin converte "restante" em "usado" e alimenta os mesmos cartões de cota dos outros provedores — as três famílias (`Gemini Models`, `Claude and GPT models`, `Gemini 4 Argon`) casam com os escopos que o painel já conhece. A chamada não consome cota de modelo (`num_turns: 0`) e levava ~3,4 s.

@@ -1,17 +1,28 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { readFileSync } from 'node:fs';
 import { PassThrough } from 'node:stream';
 import { buildPrompt, createAgy, parseModels, classifyFailure, parseUsage } from '../lib/antigravity-cli-local.js';
 
-/** Minimal stand-in for a spawned CLI that records its argv. */
+/** Minimal stand-in for a spawned CLI that records its argv and what it was fed on stdin. */
 function fakeSpawn(behaviour) {
 	const calls = [];
 	const spawn = (bin, args, options) => {
-		calls.push({ bin, args, options });
+		const call = { bin, args, options, stdin: '', settings: undefined };
+		// The transport deletes its temp directory on return, so snapshot the policy here.
+		const settingsAt = args.indexOf('--settings');
+		if (settingsAt !== -1) {
+			try {
+				call.settings = JSON.parse(readFileSync(args[settingsAt + 1], 'utf8'));
+			} catch {}
+		}
+		calls.push(call);
 		const child = new EventEmitter();
 		child.stdout = new PassThrough();
 		child.stderr = new PassThrough();
+		child.stdin = new PassThrough();
+		child.stdin.on('data', (chunk) => { call.stdin += chunk; });
 		child.kill = () => {};
 		setImmediate(() => behaviour({ args, stdout: child.stdout, stderr: child.stderr, child }));
 		return child;
@@ -66,7 +77,13 @@ test('buildPrompt keeps tool-result text and still refuses a nested image', () =
 
 test('the CLI is always called with the tool-deny policy and the chosen variant', async () => {
 	const { spawn, calls } = fakeSpawn(({ stdout, child }) => {
-		stdout.end(JSON.stringify({ status: 'SUCCESS', response: 'OK\n', usage: { input_tokens: 4, output_tokens: 2, total_tokens: 6, thinking_tokens: 1 } }));
+		// `--output-format stream-json` on 1.5.14: one event per line, last one wins.
+		stdout.end([
+			'{"event":"init","conversation_id":"c1","init":{"model":"gemini-4-hydrogen-medium"}}',
+			'{"event":"step_update","step_update":{"step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"OK"}}',
+			JSON.stringify({ event: 'result', result: { status: 'SUCCESS', response: 'OK\n', usage: { input_tokens: 4, output_tokens: 2, total_tokens: 6, thinking_tokens: 1 } } }),
+			''
+		].join('\n'));
 		child.emit('close', 0);
 	});
 	const agy = createAgy({ spawn, bin: 'agy-under-test' });
@@ -77,9 +94,17 @@ test('the CLI is always called with the tool-deny policy and the chosen variant'
 	const [call] = calls;
 	assert.equal(call.bin, 'agy-under-test');
 	assert.equal(call.options.shell, false);
-	assert.deepEqual(call.args.slice(0, 1), ['-p']);
+	// The prompt rides stdin, never argv: argv has a hard size cap on Windows.
+	assert.deepEqual(call.args.slice(0, 4), ['--input-format', 'stream-json', '--output-format', 'stream-json']);
 	assert.ok(call.args.includes('gemini-4-hydrogen-medium'));
-	const deny = JSON.parse(call.args[call.args.indexOf('--settings') + 1]);
+	assert.ok(!call.args.some((arg) => arg.includes('"hi"')), 'prompt must not appear in argv');
+	const turn = JSON.parse(call.stdin.trim());
+	assert.equal(turn.event, 'user');
+	assert.deepEqual(turn.message.content, [{ type: 'text', text: 'hi' }]);
+	// The deny policy is a file (argv has a size cap), passed by path.
+	const settingsPath = call.args[call.args.indexOf('--settings') + 1];
+	assert.match(settingsPath, /settings\.json$/u);
+	const deny = call.settings;
 	// Every action the permission engine evaluates, or a tool is left ungated.
 	assert.deepEqual(deny.permissions.deny, [
 		'read_file(*)',
@@ -90,6 +115,22 @@ test('the CLI is always called with the tool-deny policy and the chosen variant'
 		'command(*)',
 		'mcp(*)'
 	]);
+});
+
+test('a prompt far past the Windows command-line cap is still delivered', async () => {
+	const longText = 'x'.repeat(5 * 1024 * 1024);
+	let seen = '';
+	const { spawn, calls } = fakeSpawn(({ stdout, child }) => {
+		stdout.end('{"event":"result","result":{"status":"SUCCESS","response":"ok"}}\n');
+		child.emit('close', 0);
+	});
+	const agy = createAgy({ spawn, bin: 'agy-under-test' });
+	await agy.run({ model: 'gemini-4-hydrogen-medium', messages: [{ role: 'user', content: [{ type: 'text', text: longText }] }] });
+	const [call] = calls;
+	const argvBytes = call.args.reduce((total, arg) => total + Buffer.byteLength(arg) + 1, 0);
+	assert.ok(argvBytes < 8192, `argv stayed small (${argvBytes} bytes)`);
+	seen = JSON.parse(call.stdin.trim()).message.content[0].text;
+	assert.equal(seen.length, longText.length);
 });
 
 test('the quota report becomes one window per bucket, remaining turned into used', () => {
