@@ -36,6 +36,12 @@ export interface ProviderPreferences {
     tools?: Partial<Record<SubscriptionTool, boolean>>;
     /** Claude only: overrides the plugin config's `claudePromptCacheTtl`; absent follows config. */
     promptCacheTtl?: PromptCacheTtlSetting;
+    /**
+     * Antigravity only: keeps the CLI shell-free so the route answers in text.
+     * Absent means on — the CLI's command executor fails on this host, and with
+     * the shell granted the model can end a turn with an empty reply.
+     */
+    agyFix?: boolean;
 }
 export declare function validatePreferences(provider: ProviderId, input: unknown): ProviderPreferences;
 /** Durable user preferences, independent of expiring discovery caches. */
@@ -52,6 +58,8 @@ export declare class ProviderSettingsStore {
     subagentSpeed(model: string): SubagentSpeedTier;
     /** The Settings-page Claude cache TTL; undefined follows the plugin config. Read per request, so no clone. */
     promptCacheTtl(): PromptCacheTtlSetting | undefined;
+    /** The Antigravity empty-reply fix; on unless the user turned it off. Read per request, so no clone. */
+    agyFix(): boolean;
     /** Creation-time policy survives restarts and never changes an existing session. */
     toolEnabled(provider: ProviderId, tool: SubscriptionTool, createdAt?: number): boolean;
     set(provider: ProviderId, input: unknown): Promise<void>;

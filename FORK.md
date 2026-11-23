@@ -46,6 +46,15 @@ Com o shell liberado, o modelo precisa dele para explorar o repositório, tenta 
 
 `read_file` e `list_dir` funcionam (verificado: leu um arquivo e devolveu o conteúdo), então a rota mantém os olhos — só não tem mãos. O prompt ainda começa com uma linha (`ROUTE_NOTE`) avisando que shell e escrita estão negados, para o modelo não gastar o turno descobrindo isso.
 
+## Interruptor na aba Google (Settings → Subscriptions)
+
+O comportamento acima é o padrão, e a aba **Google / Antigravity** traz um interruptor **ligado por padrão** para ele:
+
+- **Ligado (padrão)** — a rota roda sem shell: `allow: ['read_file(*)','read_url(*)']`, `deny` nas outras cinco ações, e o prompt abre com `ROUTE_NOTE`. É o que evita a resposta vazia.
+- **Desligado** — restaura o comportamento anterior: `allow: ['*']` (todas as ferramentas do CLI) e **nenhuma** nota no prompt. Serve para experimentar outra versão do `agy` ou diagnosticar a rota; neste host o `run_command` continua falhando, então desligar traz de volta o risco de `EMPTY_RESPONSE`.
+
+O valor mora em `provider-settings.json` (`antigravity.agyFix`), é lido a cada chamada — sem reiniciar o Harness — e é reaplicado no mount do plugin. O RPC é `setAgyFix` (`{ value: boolean }`) e o `status` da rota devolve `agyFix` para a UI. O texto na tela explica em uma linha: o executor de comandos do CLI falha neste host e, com ele liberado, a rodada pode terminar vazia; desligar entrega todas as ferramentas ao CLI.
+
 O CLI trabalha no diretório da sessão: o plugin resolve o workspace via `ctx.get("workingDirectory")` a partir do `sessionId` da chamada (`lib/index.js`, `resolveAgyWorkspace`), passa `--add-dir <workspace>` e usa esse diretório como `cwd`, de modo que caminhos relativos resolvem no repo. Sem `sessionId` (chamadas avulsas, testes), cai para o diretório temporário da chamada. O `settings.json` continua no temporário — nunca dentro do repo — e o `finally` apaga o temporário, nunca o workspace.
 
 Aviso: isso executa fora do sandbox e da trilha de auditoria do DSH. O `agy` executa por conta própria e devolve só o texto final — nada aparece no transcript como `tool/call`. É um agente dentro do agente, não um modelo com as ferramentas do harnês. Use só em workspaces confiáveis. As rotas OpenAI/Claude continuam sendo a opção auditável (ferramentas executadas pelo DSH, evento por evento).

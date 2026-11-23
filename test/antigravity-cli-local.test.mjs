@@ -75,7 +75,7 @@ test('buildPrompt keeps tool-result text and still refuses a nested image', () =
 	] }), /text-only/u);
 });
 
-test('the CLI is always called with the full-access policy and the chosen variant', async () => {
+test('with the route fix on, the CLI is called shell-free and the prompt says so', async () => {
 	const { spawn, calls } = fakeSpawn(({ stdout, child }) => {
 		// `--output-format stream-json` on 1.5.14: one event per line, last one wins.
 		stdout.end([
@@ -117,6 +117,43 @@ test('the CLI is always called with the full-access policy and the chosen varian
 	assert.ok(!call.args.includes('--add-dir'), 'no workspace, no --add-dir');
 	assert.ok(settingsPath.startsWith(call.options.cwd), 'policy lives next to the run cwd');
 	assert.match(settingsPath, /settings\.json$/u);
+});
+
+test('with the route fix off, every CLI tool is granted and no note is added', async () => {
+	const { spawn, calls } = fakeSpawn(({ stdout, child }) => {
+		stdout.end('{"event":"result","result":{"status":"SUCCESS","response":"ok"}}\n');
+		child.emit('close', 0);
+	});
+	// The switch is read per call, so the same transport follows a live change.
+	let fix = false;
+	const agy = createAgy({ spawn, bin: 'agy-under-test', fixOf: () => fix });
+	await agy.run({ model: 'gemini-4-hydrogen-medium', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] });
+	const [call] = calls;
+	// No note: the prompt is exactly the request.
+	assert.equal(JSON.parse(call.stdin.trim()).message.content[0].text, 'hi');
+	// Every tool granted, and no deny list at all.
+	assert.deepEqual(call.settings, { permissions: { allow: ['*'] } });
+});
+
+test('the route fix follows the switch without rebuilding the transport', async () => {
+	const { spawn, calls } = fakeSpawn(({ stdout, child }) => {
+		stdout.end('{"event":"result","result":{"status":"SUCCESS","response":"ok"}}\n');
+		child.emit('close', 0);
+	});
+	let fix = true;
+	const agy = createAgy({ spawn, bin: 'agy-under-test', fixOf: () => fix });
+	const run = () => agy.run({ model: 'gemini-4-hydrogen-medium', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] });
+	await run();
+	fix = false;
+	await run();
+	const [on, off] = calls;
+	assert.deepEqual(on.settings.permissions, {
+		allow: ['read_file(*)', 'read_url(*)'],
+		deny: ['write_file(*)', 'command(*)', 'execute_url(*)', 'download_url(*)', 'mcp(*)']
+	});
+	assert.match(JSON.parse(on.stdin.trim()).message.content[0].text, /^Route note:/u);
+	assert.deepEqual(off.settings, { permissions: { allow: ['*'] } });
+	assert.equal(JSON.parse(off.stdin.trim()).message.content[0].text, 'hi');
 });
 
 test('a session workspace becomes the CLI cwd and is registered with --add-dir', async () => {
