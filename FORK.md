@@ -44,6 +44,8 @@ Aviso: isso executa fora do sandbox e da trilha de auditoria do DSH. O `agy` exe
 
 A política de retry da rota é `maxRetries: 0` e sem códigos repetíveis: um 429 aparece como 429, sem laço de novas tentativas.
 
+O teto de cada chamada é de **1 h** (`timeoutMs`, padrão do `createAgy`): revisões grandes no CLI passam fácil de 15 min, e matar no meio descarta a resposta parcial junto. Tarefa que precisa de mais que isso deve ser fatiada — o teto maior só adia o mesmo fracasso.
+
 A metade cliente (`lib/client.js`) registra o próprio módulo com `__ModuleLoader__.load({ id: ... })`. Ao renomear o pacote, esse `id` precisa acompanhar, senão a página acusa "loaded without registering ... via __ModuleLoader__.load".
 
 Este fork modifica os bundles publicados; não rode o build upstream sobre esta cópia sem reaplicar as mudanças.
