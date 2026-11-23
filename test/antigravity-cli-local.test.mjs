@@ -42,6 +42,28 @@ test('buildPrompt sends one user turn verbatim and refuses non-text blocks', () 
 	assert.throws(() => buildPrompt({ messages: [{ role: 'user', content: [{ type: 'image', attachment: {} }] }] }), /text-only/u);
 });
 
+test('buildPrompt drops reasoning and tool-call blocks so a mid-session switch survives', () => {
+	const prompt = buildPrompt({ messages: [
+		{ role: 'user', content: [{ type: 'text', text: 'q' }] },
+		{ role: 'assistant', content: [{ type: 'reasoning', text: 'private thinking' }, { type: 'tool-call', name: 'pwsh', arguments: '{"command":"ls"}' }, { type: 'text', text: 'a' }] },
+		{ role: 'user', content: [{ type: 'reasoning', text: 'more thinking' }, { type: 'text', text: 'q2' }] }
+	] });
+	assert.equal(prompt, 'User: q\n\nAssistant: a\n\nUser: q2');
+	assert.doesNotMatch(prompt, /thinking|ls/u);
+});
+
+test('buildPrompt keeps tool-result text and still refuses a nested image', () => {
+	const prompt = buildPrompt({ messages: [
+		{ role: 'user', content: [{ type: 'text', text: 'q' }] },
+		{ role: 'assistant', content: [{ type: 'text', text: 'a' }] },
+		{ role: 'tool', content: [{ type: 'tool-result', content: [{ type: 'text', text: 'ok' }] }] }
+	] });
+	assert.match(prompt, /Tool result: ok$/u);
+	assert.throws(() => buildPrompt({ messages: [
+		{ role: 'tool', content: [{ type: 'tool-result', content: [{ type: 'text', text: 'ok' }, { type: 'image', attachment: {} }] }] }
+	] }), /text-only/u);
+});
+
 test('the CLI is always called with the tool-deny policy and the chosen variant', async () => {
 	const { spawn, calls } = fakeSpawn(({ stdout, child }) => {
 		stdout.end(JSON.stringify({ status: 'SUCCESS', response: 'OK\n', usage: { input_tokens: 4, output_tokens: 2, total_tokens: 6, thinking_tokens: 1 } }));
