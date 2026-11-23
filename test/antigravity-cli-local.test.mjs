@@ -100,11 +100,19 @@ test('the CLI is always called with the full-access policy and the chosen varian
 	assert.ok(!call.args.some((arg) => arg.includes('"hi"')), 'prompt must not appear in argv');
 	const turn = JSON.parse(call.stdin.trim());
 	assert.equal(turn.event, 'user');
-	assert.deepEqual(turn.message.content, [{ type: 'text', text: 'hi' }]);
-	// The allow policy is a file (argv has a size cap), passed by path.
+	// The route note comes first, then the request itself.
+	const text = turn.message.content[0].text;
+	assert.match(text, /^Route note:/u);
+	assert.match(text, /\n\nhi$/u);
+	// The policy is a file (argv has a size cap), passed by path.
 	const settingsPath = call.args[call.args.indexOf('--settings') + 1];
 	assert.match(settingsPath, /settings\.json$/u);
-	assert.deepEqual(call.settings, { permissions: { allow: ['*'] } });
+	assert.deepEqual(call.settings, {
+		permissions: {
+			allow: ['read_file(*)', 'read_url(*)'],
+			deny: ['write_file(*)', 'command(*)', 'execute_url(*)', 'download_url(*)', 'mcp(*)']
+		}
+	});
 	// Without a workspace the CLI runs in its temp directory and adds nothing.
 	assert.ok(!call.args.includes('--add-dir'), 'no workspace, no --add-dir');
 	assert.ok(settingsPath.startsWith(call.options.cwd), 'policy lives next to the run cwd');
@@ -126,7 +134,12 @@ test('a session workspace becomes the CLI cwd and is registered with --add-dir',
 	// The policy file still lives in the temp directory, not in the repo.
 	const settingsPath = call.args[call.args.indexOf('--settings') + 1];
 	assert.ok(!settingsPath.startsWith('D:\\Projetos\\SIG'), 'policy must not pollute the workspace');
-	assert.deepEqual(call.settings, { permissions: { allow: ['*'] } });
+	assert.deepEqual(call.settings, {
+		permissions: {
+			allow: ['read_file(*)', 'read_url(*)'],
+			deny: ['write_file(*)', 'command(*)', 'execute_url(*)', 'download_url(*)', 'mcp(*)']
+		}
+	});
 });
 
 test('a prompt far past the Windows command-line cap is still delivered', async () => {
@@ -142,7 +155,8 @@ test('a prompt far past the Windows command-line cap is still delivered', async 
 	const argvBytes = call.args.reduce((total, arg) => total + Buffer.byteLength(arg) + 1, 0);
 	assert.ok(argvBytes < 8192, `argv stayed small (${argvBytes} bytes)`);
 	seen = JSON.parse(call.stdin.trim()).message.content[0].text;
-	assert.equal(seen.length, longText.length);
+	// The route note prefixes the prompt; the payload itself must survive whole.
+	assert.ok(seen.endsWith(longText), 'prompt body delivered intact');
 });
 
 test('the quota report becomes one window per bucket, remaining turned into used', () => {

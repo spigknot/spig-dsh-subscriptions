@@ -36,7 +36,15 @@ As barras de cota vêm do CLI, não de HTTP com token: `agy -p /usage --output-f
 
 No painel, a rota aparece conectada quando `agy models` responde — que é a prova de que o CLI está autenticado. O `status` devolve `cliManaged` (a conta é do CLI) e `cliActive` (o catálogo respondeu), além de uma linha de conta sintética `agy-cli`, porque as barras de cota são renderizadas por conta. Quando o CLI falha, a mensagem do erro vai em `detail` e aparece no cartão.
 
-Ferramentas do próprio CLI rodam com acesso total, por decisão explícita: a política em `--settings` é `{"permissions":{"allow":["*"]}}`, verificada ao vivo no `agy` 1.5.14 (leitura por caminho absoluto e por caminho relativo ao workspace, ambas respondendo o conteúdo do arquivo). O `*` sozinho é honrado nessa versão; se um `agy` futuro passar a ignorá-lo, as leituras voltam como recusas e o ponto de ajuste é a constante `ALLOW_RULES` em `lib/antigravity-cli-local.js`.
+Ferramentas do próprio CLI: **só leitura**. A política em `--settings` libera `read_file(*)` e `read_url(*)` e nega `write_file`, `command`, `execute_url`, `download_url` e `mcp`, cada uma com `(*)`.
+
+## Por que o shell do CLI fica negado (achado de 23/11)
+
+O transporte já rodou com acesso total (`allow: ["*"]`) e isso causou **respostas vazias**. O motivo está no próprio `agy`: o `run_command` dele falha neste host com **`0xC0000142`** (`STATUS_DLL_INIT_FAILED`) — a saída é sempre `Command exited with code -1073741502` e `No output from the command`. Reproduzido de duas formas independentes (com pipes e com stdin/stdout em arquivo), portanto não é do spawn do DSH nem do modelo: tanto o Neon quanto o Hydrogen mostraram o mesmo comportamento.
+
+Com o shell liberado, o modelo precisa dele para explorar o repositório, tenta `run_command`, recebe lixo, tenta de novo com outro comando, e depois de ~6 min a rodada termina com `status: SUCCESS` e **`response` vazio** — que é o erro `EMPTY_RESPONSE` que aparece na tela. Com a negação explícita, a recusa é imediata e o modelo responde em texto.
+
+`read_file` e `list_dir` funcionam (verificado: leu um arquivo e devolveu o conteúdo), então a rota mantém os olhos — só não tem mãos. O prompt ainda começa com uma linha (`ROUTE_NOTE`) avisando que shell e escrita estão negados, para o modelo não gastar o turno descobrindo isso.
 
 O CLI trabalha no diretório da sessão: o plugin resolve o workspace via `ctx.get("workingDirectory")` a partir do `sessionId` da chamada (`lib/index.js`, `resolveAgyWorkspace`), passa `--add-dir <workspace>` e usa esse diretório como `cwd`, de modo que caminhos relativos resolvem no repo. Sem `sessionId` (chamadas avulsas, testes), cai para o diretório temporário da chamada. O `settings.json` continua no temporário — nunca dentro do repo — e o `finally` apaga o temporário, nunca o workspace.
 
