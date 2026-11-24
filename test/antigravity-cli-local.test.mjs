@@ -251,3 +251,13 @@ test('listing models runs the CLI once and then serves the cached catalog', asyn
 	assert.equal((await agy.listModels()).length, 1);
 	assert.equal(runs, 1);
 });
+
+test('the CLI version is read once and reported', async () => {
+	const { spawn, calls } = fakeSpawn(({ stdout, child }) => {
+		stdout.end('1.5.15\n');
+		child.emit('close', 0);
+	});
+	const agy = createAgy({ spawn, bin: 'agy-under-test' });
+	assert.equal(await agy.version(), '1.5.15');
+	assert.deepEqual(calls[0].args, ['--version']);
+});
