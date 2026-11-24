@@ -1,7 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
+import { rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { buildPrompt, createAgy, parseModels, classifyFailure, parseUsage } from '../lib/antigravity-cli-local.js';
 
@@ -261,3 +264,44 @@ test('the CLI version is read once and reported', async () => {
 	assert.equal(await agy.version(), '1.5.15');
 	assert.deepEqual(calls[0].args, ['--version']);
 });
+
+test('the opt-in journal records what was sent and what came back', async () => {
+	const log = join(tmpdir(), `dsh-agy-test-${Date.now()}.log`);
+	const { spawn } = fakeSpawn(({ stdout, child }) => {
+		stdout.end('{"event":"result","result":{"status":"SUCCESS","response":"resposta de teste"}}\n');
+		child.emit('close', 0);
+	});
+	process.env.DSH_AGY_DEBUG = '1';
+	process.env.DSH_AGY_DEBUG_LOG = log;
+	try {
+		const agy = createAgy({ spawn, bin: 'agy-under-test' });
+		await agy.run({ model: 'gemini-4-hydrogen', messages: [{ role: 'user', content: [{ type: 'text', text: 'pedido atual' }] }] });
+		const line = JSON.parse(readFileSync(log, 'utf8').trim().split('\n').at(-1));
+		assert.equal(line.model, 'gemini-4-hydrogen');
+		assert.equal(line.fix, true);
+		assert.ok(line.promptBytes > 0);
+		assert.match(line.promptTail, /pedido atual$/u);
+		assert.equal(line.responseHead, 'resposta de teste');
+		assert.ok(line.ms >= 0);
+	} finally {
+		delete process.env.DSH_AGY_DEBUG;
+		delete process.env.DSH_AGY_DEBUG_LOG;
+		await rm(log, { force: true });
+	}
+});
+
+test('without the switch the journal stays silent', async () => {
+	const log = join(tmpdir(), `dsh-agy-test-off-${Date.now()}.log`);
+	const { spawn } = fakeSpawn(({ stdout, child }) => {
+		stdout.end('{"event":"result","result":{"status":"SUCCESS","response":"ok"}}\n');
+		child.emit('close', 0);
+	});
+	process.env.DSH_AGY_DEBUG_LOG = log;
+	try {
+		await createAgy({ spawn, bin: 'agy-under-test' }).run({ model: 'gemini-4-hydrogen', messages: [{ role: 'user', content: [{ type: 'text', text: 'x' }] }] });
+		assert.equal(existsSync(log), false);
+	} finally {
+		delete process.env.DSH_AGY_DEBUG_LOG;
+	}
+});
+
