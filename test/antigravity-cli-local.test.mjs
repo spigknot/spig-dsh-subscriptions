@@ -51,8 +51,9 @@ test('buildPrompt sends one user turn verbatim and refuses non-text blocks', () 
 	assert.equal(buildPrompt({ messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] }), 'hi');
 	assert.match(buildPrompt({ messages: [
 		{ role: 'user', content: [{ type: 'text', text: 'q' }] },
-		{ role: 'assistant', content: [{ type: 'text', text: 'a' }] }
-	] }), /^User: q\n\nAssistant: a$/);
+		{ role: 'assistant', content: [{ type: 'text', text: 'a' }] },
+		{ role: 'user', content: [{ type: 'text', text: 'q2' }] }
+	] }), /^User: q\n\nAssistant: a\n\nUser: q2$/);
 	assert.throws(() => buildPrompt({ messages: [{ role: 'user', content: [{ type: 'image', attachment: {} }] }] }), /text-only/u);
 });
 
@@ -70,9 +71,10 @@ test('buildPrompt keeps tool-result text and still refuses a nested image', () =
 	const prompt = buildPrompt({ messages: [
 		{ role: 'user', content: [{ type: 'text', text: 'q' }] },
 		{ role: 'assistant', content: [{ type: 'text', text: 'a' }] },
-		{ role: 'tool', content: [{ type: 'tool-result', content: [{ type: 'text', text: 'ok' }] }] }
+		{ role: 'tool', content: [{ type: 'tool-result', content: [{ type: 'text', text: 'ok' }] }] },
+		{ role: 'user', content: [{ type: 'text', text: 'next' }] }
 	] });
-	assert.match(prompt, /Tool result: ok$/u);
+	assert.match(prompt, /Tool result: ok\n\nUser: next$/u);
 	assert.throws(() => buildPrompt({ messages: [
 		{ role: 'tool', content: [{ type: 'tool-result', content: [{ type: 'text', text: 'ok' }, { type: 'image', attachment: {} }] }] }
 	] }), /text-only/u);
@@ -328,3 +330,34 @@ test('a request made only of metadata still fails closed', () => {
 		(error) => error.code === 'EMPTY_REQUEST'
 	);
 });
+
+test('an attachment-only turn fails loudly instead of answering the history', () => {
+	// What the CLI route actually receives when the user sends a report and no text:
+	// the attachment block never arrives (inputModalities is text-only) and what is
+	// left is harness metadata. Guessing from history produced answers about rounds
+	// ten turns old, so this must be an explicit failure.
+	assert.throws(
+		() => buildPrompt({
+			messages: [
+				{ role: 'user', content: [{ type: 'text', text: 'relatorio da R30 anexado' }] },
+				{ role: 'assistant', content: [{ type: 'text', text: 'parecer da R30' }] },
+				{ role: 'user', content: [{ type: 'text', text: '<system-reminder> The available skill catalog changed.' }] },
+				{ role: 'user', content: [{ type: 'text', text: 'Time sampled while preparing turn 59, step 1: 2026-11-24T18:38:07-03:00' }] },
+				{ role: 'user', content: [{ type: 'text', text: '[model changed: gemini-4-argon; continues with gemini-4-neon]' }] }
+			]
+		}),
+		(error) => error.code === 'EMPTY_REQUEST'
+	);
+});
+
+test('a real request after an attachment still goes through', () => {
+	const prompt = buildPrompt({
+		messages: [
+			{ role: 'user', content: [{ type: 'text', text: '<system-reminder> skill catalog' }] },
+			{ role: 'user', content: [{ type: 'text', text: 'Segue o relatorio da R38; gere a R39' }] }
+		]
+	});
+	assert.match(prompt, /gere a R39$/u);
+	assert.doesNotMatch(prompt, /skill catalog/u);
+});
+
