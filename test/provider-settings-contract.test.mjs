@@ -87,6 +87,35 @@ test('toggles merge into the stored provider document instead of replacing it', 
 	}
 });
 
+test('the compaction-model choice is wired: routing at mount, recovery budget and RPC endpoints', () => {
+	assert.match(bundle, /import \{[^}]*CompactionModelStore[^}]*installCompactionRouting[^}]*summaryChunkBudget[^}]*\} from "\.\/compaction-model\.js";/u);
+	assert.match(bundle, /installCompactionRouting\(ctx, \{\s*store: compactionModel,/u);
+	assert.match(bundle, /chunkBudgetFor: \(_agent, signal\) => summaryChunkBudget\(\{ store: compactionModel, llm: ctx\.llm, signal \}\)/u);
+	for (const endpoint of ['compactionModel', 'setCompactionModel']) {
+		assert.match(bundle, new RegExp(`"${endpoint}",`, 'u'), `${endpoint} must be a registered endpoint`);
+		assert.match(bundle, new RegExp(`case "${endpoint}":`, 'u'), `${endpoint} must be dispatched`);
+	}
+	const client = readFileSync(new URL('client.js', root), 'utf8');
+	assert.match(client, /function CompactionModelSetting\(/u);
+	// The reasoning selector: "default" plus only the levels the chosen model accepts.
+	assert.match(client, /children: t\("compactionEffort"\)/u);
+	assert.match(client, /value: "default",\s*children: t\("compactionEffortDefault"\)/u);
+	assert.match(client, /efforts\.map\(\(id\) =>/u);
+	assert.match(client, /setEffort\(current\?\.effort \?\? "default"\)/u);
+	assert.match(client, /save\(\{\s*provider,\s*model,\s*scope,\s*effort\s*\}\)/u);
+	// The same effort list for every model, and a safe fallback when the model
+	// does not declare the chosen level (DSH would reject the call outright).
+	assert.match(bundle, /COMPACTION_EFFORTS, CompactionModelStore/u);
+	assert.match(bundle, /efforts: COMPACTION_EFFORTS,/u);
+	assert.match(readFileSync(new URL('compaction-model.js', root), 'utf8'), /does not declare reasoning effort/u);
+	// The save handler must not reject a level from the fixed list.
+	const handler = bundle.slice(bundle.indexOf('async setCompactionModel(value)'), bundle.indexOf('async setCompactionModel(value)') + 1_600);
+	assert.ok(handler.length > 0, 'setCompactionModel must exist');
+	assert.doesNotMatch(handler, /does not support reasoning effort|not support reasoning/u);
+	// Rendered right after the Proxy card.
+	assert.match(client, /proxyStatusText\(t, proxy, proxyLoadError\)\s*\}\)\]\s*\}\),\s*\/\* @__PURE__ \*\/ \(0, react_jsx_runtime\.jsx\)\(CompactionModelSetting,/u);
+});
+
 test('standalone provider-settings.js does not drift from the bundled copy', () => {
 	// Nothing imports it, so it must not pretend to own a method the bundle lacks.
 	const standalone = readFileSync(new URL('provider-settings.js', root), 'utf8');

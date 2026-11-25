@@ -307,6 +307,32 @@ test('oversized history raises DSH context overflow without launching the CLI', 
 	assert.equal(calls.length, 0);
 });
 
+test('the answer is returned as soon as the result arrives, without waiting for agy to exit', async () => {
+	// agy 1.5.16 in a git workspace keeps running ~10 minutes after its result.
+	let killed = false;
+	const { spawn } = fakeSpawn(({ stdout, child }) => {
+		child.kill = () => { killed = true; };
+		stdout.write('{"event":"init","conversation_id":"c"}\n');
+		stdout.write('{"event":"result","result":{"status":"SUCCESS","response":"pronto"}}\n');
+		// no end, no close: the process lingers
+	});
+	const agy = createAgy({ spawn, bin: 'agy-under-test', timeoutMs: 60_000 });
+	const started = Date.now();
+	const result = await agy.run({ model: 'test', messages: [{ role: 'user', content: 'q' }] });
+	assert.equal(result.text, 'pronto');
+	assert.ok(Date.now() - started < 5_000);
+	assert.equal(killed, true, 'the lingering process is terminated');
+});
+
+test('a quota error result is classified as a rate limit, not a generic failure', async () => {
+	const { spawn } = fakeSpawn(({ stdout, child }) => {
+		child.kill = () => {};
+		stdout.write(`${JSON.stringify({ event: 'result', result: { status: 'ERROR', response: '', error: 'transport error (ResourceExhausted, HTTP 429): Individual quota reached. Resets in 107h16m44s.' } })}\n`);
+	});
+	const agy = createAgy({ spawn, bin: 'agy-under-test' });
+	await assert.rejects(agy.run({ model: 'test', messages: [{ role: 'user', content: 'q' }] }), (error) => error.code === 'RATE_LIMIT' && /Individual quota reached/u.test(error.message));
+});
+
 test('with the long-prompt guard off the route sends everything, as before', async () => {
 	const { spawn, calls } = fakeSpawn(({ stdout, child }) => {
 		stdout.end('{"event":"result","result":{"status":"SUCCESS","response":"ok"}}\n');

@@ -179,7 +179,52 @@ Observação: os testes do módulo de recuperação e dos botões foram escritos
 
 ---
 
-## 8. Limitações e próximos passos
+## 8. Primeiro teste real (25/11, sessão `0e41e241`) e correções decorrentes
+
+**O que aconteceu** (eventos da sessão + logs `cli-20261125_071050.log` e `cli-20261125_072243.log`):
+
+| Hora (UTC) | Evento |
+|---|---|
+| 05:26–05:27 | Seleção de modelo: Neon, depois **`antigravity/claude-opus-5-5`** (último valor efetivo) |
+| 10:10:49 | Turno 29: prompt de **554.648 bytes** → recusado antes do envio (correto) |
+| 10:10:50–10:22:40 | 1º resumo: eventos 18–164 viram um checkpoint de 8,3 KB. O modelo respondeu em ~70 s; o `agy` ficou **~10,5 min** parado antes de sair |
+| 10:22:40–10:34:20 | 2º resumo: Google respondeu **HTTP 429 "Individual quota reached… Resets in 107h16m44s"** (cota Claude); de novo ~11 min até o processo sair |
+| 10:34:20 | Turno encerrado com a recusa genérica ("must be compacted first"), sem citar a cota |
+
+O primeiro resumo foi gravado. Pela medida do plugin, ainda restavam cerca de 390 KB, por isso era necessária uma segunda rodada.
+
+**Descoberta: atraso de ~10 minutos em todas as chamadas no workspace do SIG.** Em 69 logs do `agy`, todas as execuções com `--add-dir` num repositório git ficaram 4–11 min (mediana ~10 min) entre "stream input closed" e "Language server shutting down"; sem workspace, saem na hora. O plugin esperava o processo terminar, então cada turno da rota pagava esse atraso (o que explica a necessidade anterior de timeout de 60 min).
+
+**Correções:**
+1. **Encerramento ao receber o resultado** (`runProcess` com `doneWhen`): assim que uma linha completa do evento `result` chega no stdout, a chamada termina e o processo é encerrado. Medido no ambiente real com o workspace do SIG: **39 s** (antes ~10,5 min), nenhum processo `agy` remanescente.
+2. **Erro de resultado classificado**: um `result` com `status: ERROR` passa pela classificação; cota esgotada vira `RATE_LIMIT` (429) com a mensagem original do Google. Formato capturado de uma execução real com cota esgotada.
+3. **Causa real quando a compactação falha**: a recuperação registra o motivo por sessão e pede uma nova tentativa; o adaptador encontra o registro e encerra o turno com "The conversation history could not be compacted to fit this route: …" mantendo o código (ex.: 429 e o prazo de reset), sem iniciar o `agy`. O resumo já feito é mantido. Sem laço: o erro dessa tentativa não é o código da recuperação.
+
+Testes: 50/50, incluindo um terceiro cenário de integração no DSH real (429 durante o resumo → turno termina como `RATE_LIMIT`, uma única tentativa de resumo, nada acima do teto enviado).
+
+**Observação:** o resumo usa o modelo da sessão. Com Claude Opus pelo Antigravity, a compactação consumiu a cota Claude. Para poupar essa cota, selecionar um Gemini antes de enviar, ou configurar o sumarizador da compactação para outra rota (mudança de perfil, não feita).
+
+## 9. Opção "Compaction model" (modelo que faz a compactação)
+
+**Onde:** Settings → Subscriptions, cartão **"Compaction model"** logo abaixo de **"Proxy"**. Campos: provedor (qualquer rota registrada no DSH, inclusive DeepSeek), modelo daquele provedor, **esforço de raciocínio** e alcance ("all conversations" ou "Antigravity conversations only"). Botão "Use the conversation model" volta ao padrão do DSH.
+
+**Esforço de raciocínio:** lista fixa, igual para todos os modelos: **Default (the model's own)**, **off, low, medium, high, xhigh, max**. O esforço da conversa nunca é herdado — ele pertence a outro modelo. Com "Default", nenhum esforço é imposto: vale o padrão configurado para o modelo no DSH ou o do próprio provedor. Na rota Antigravity, o adaptador aplica o esforço configurado do modelo (medium, no perfil atual) quando nenhum é pedido.
+
+**Proteção:** o DSH rejeita uma chamada cujo esforço o modelo não declara (`UNSUPPORTED_REASONING_EFFORT`), o que faria a compactação inteira falhar. Por isso o redirecionamento consulta o modelo; se o nível escolhido não estiver entre os declarados, o resumo usa o padrão do modelo e o plugin registra um aviso no log, em vez de falhar.
+
+**Como funciona** (`lib/compaction-model.js`):
+- A escolha é salva em `~/.dsh/plugins/subscriptions/compaction-model.json`; ausente = padrão do DSH (o próprio modelo da conversa).
+- Um listener do `llm/stream` redireciona **somente** chamadas com `purpose: 'compaction'` (a chamada de resumo da compactação do DSH) para o provedor/modelo escolhido. Pedidos da conversa nunca são alterados. A chamada redirecionada passa pelo runtime completo do DSH.
+- Não leva o esforço de raciocínio da conversa para o outro modelo e reduz o limite de saída ao que o modelo escolhido declara.
+- Vale para a compactação automática, a de troca de modelo, a manual (`/compact`) e a recuperação do Antigravity.
+- Na rota Antigravity, se o modelo escolhido não for o próprio `agy`, a recuperação deixa de fatiar o histórico em blocos de 180 KB e resume tudo de uma vez, dentro da janela do modelo escolhido (≈ janela × 2,5 bytes × 60%). O teto de 180 KB continua valendo para o prompt da conversa.
+- Ao salvar, o host confere se o provedor está registrado e se o modelo existe nele.
+
+**Testes:** `test/compaction-model.test.mjs` (persistência, validação, redirecionamento, alcance, ausência de laço, limite de saída, orçamento) e um quarto cenário de integração no DSH real: com um "DeepSeek" simulado escolhido, o histórico é resumido por ele numa única rodada, nenhum resumo vai ao CLI, o pedido atual não entra no resumo e a resposta final traz os fatos do histórico. Suíte completa: 60/60.
+
+**Ainda não verificado:** a interface no DSH em execução (requer reinício) e um resumo real pelo DeepSeek.
+
+## 10. Limitações e próximos passos
 
 - O teto de 180 KB é empírico para o `agy` 1.5.16; deve ser medido de novo a cada atualização do `agy`.
 - Se uma única mensagem antiga tiver mais de ~170 KB, ela não pode ser resumida por esta rota; o turno falha com explicação. Alternativa: configurar o sumarizador da compactação para outra rota (mudança de perfil, não feita).

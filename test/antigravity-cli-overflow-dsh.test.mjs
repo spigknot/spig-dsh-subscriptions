@@ -17,6 +17,9 @@ import { fileURLToPath } from 'node:url';
 import { createCliAdapter } from '../lib/antigravity-cli-adapter.js';
 import { createAgy, MAX_AGY_PROMPT_BYTES } from '../lib/antigravity-cli-local.js';
 import { installAgyOverflowRecovery } from '../lib/antigravity-cli-recovery.js';
+import { CompactionModelStore, installCompactionRouting, summaryChunkBudget } from '../lib/compaction-model.js';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 
 const packages = [
 	'llm', 'agent', 'agent-loop', 'tools', 'system-prompt', 'session-projection',
@@ -40,7 +43,9 @@ function missingPackage() {
 
 const scenarios = [
 	['a long history is compacted through the CLI itself and the current request is answered', false],
-	['runtime context admitted after the request does not get the request compacted', true]
+	['runtime context admitted after the request does not get the request compacted', true],
+	['a quota error while summarizing ends the turn with the real cause', false, 'quota'],
+	['a chosen compaction model summarizes the history instead of the CLI, in one round', true, 'routed']
 ];
 
 if (needsElectron && process.env.DSH_NODE_EXECUTABLE) {
@@ -53,7 +58,7 @@ if (needsElectron && process.env.DSH_NODE_EXECUTABLE) {
 	});
 } else {
 	const missing = missingPackage();
-	for (const [scenario, trailingContext] of scenarios) {
+	for (const [scenario, trailingContext, mode] of scenarios) {
 		test(scenario, { skip: missing && `requires installed DSH packages (missing ${missing})`, timeout: 30_000 }, async (t) => {
 			const dsh = (name) => requireDsh(`@deepseek-ai/dsh-${name}`);
 			const { Context } = requireDsh('@deepseek-ai/cordis');
@@ -98,6 +103,13 @@ if (needsElectron && process.env.DSH_NODE_EXECUTABLE) {
 					// What agy 1.5.16 actually lets the model see.
 					const visible = bytes.subarray(0, AGY_VISIBLE_BYTES).toString('utf8');
 					let response;
+					if (mode === 'quota' && visible.includes('acting as a compaction engine')) {
+						summaries.push({ bytes: bytes.length, current: text.includes(current) });
+						// What agy 1.5.16 prints for an exhausted quota (captured from a real run).
+						child.stdout.end(`${JSON.stringify({ event: 'result', result: { status: 'ERROR', response: '', error: 'Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 107h16m44s.', finished_reason: 'error' } })}\n`);
+						setImmediate(() => child.emit('close', 3));
+						return;
+					}
 					if (visible.includes('acting as a compaction engine')) {
 						summaries.push({ bytes: bytes.length, current: text.includes(current) });
 						response = `## Primary Request and Intent\n- ${factsIn(visible).join(' ') || '(none)'}`;
@@ -127,7 +139,37 @@ if (needsElectron && process.env.DSH_NODE_EXECUTABLE) {
 				},
 				error: (message, code) => new LlmError(message, code)
 			})));
-			installAgyOverflowRecovery(ctx, { onWarn: (message) => warnings.push(message) });
+			// The Settings choice: a cheap model on another route summarizes history.
+			const storeDir = mkdtempSync(join(tmpdir(), 'dsh-compaction-model-'));
+			t.after(() => rmSync(storeDir, { recursive: true, force: true }));
+			const store = new CompactionModelStore(join(storeDir, 'compaction-model.json'));
+			const routedSummaries = [];
+			if (mode === 'routed') {
+				class FakeDeepSeek extends LlmAdapter {
+					async resolveModel(provider, id) {
+						return { provider, id, name: id, inputModalities: ['text'], context: { contextWindow: 1_048_576 }, defaultMaxTokens: 8192 };
+					}
+					async listModels(provider) {
+						return [{ provider, id: 'deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash' }];
+					}
+					async *stream(options) {
+						const input = options.messages.flatMap((message) => (Array.isArray(message.content) ? message.content : [{ text: message.content }])).map((block) => block.text ?? '').join('\n');
+						routedSummaries.push({ bytes: Buffer.byteLength(input), purpose: options.purpose, maxTokens: options.maxTokens, current: input.includes(current) });
+						const text = `## Primary Request and Intent\n- ${factsIn(input).join(' ') || '(none)'}`;
+						yield { type: 'block-start', index: 0, blockType: 'text' };
+						yield { type: 'text-delta', index: 0, text };
+						yield { type: 'block-end', index: 0, block: { type: 'text', text } };
+						yield { type: 'finish', reason: { kind: 'stop' } };
+					}
+				}
+				ctx.llm.registerAdapter(['fixture-deepseek'], new FakeDeepSeek());
+				await store.set({ provider: 'fixture-deepseek', model: 'deepseek-v4.1-flash', scope: 'antigravity' });
+				installCompactionRouting(ctx, { store });
+			}
+			installAgyOverflowRecovery(ctx, {
+				onWarn: (message) => warnings.push(message),
+				chunkBudgetFor: (_agent, signal) => summaryChunkBudget({ store, llm: ctx.llm, signal })
+			});
 
 			let runtimeContext = '';
 			if (trailingContext) ctx.systemPrompt.context({ name: 'fixture-runtime-context', order: 1, text: () => runtimeContext });
@@ -161,10 +203,28 @@ if (needsElectron && process.env.DSH_NODE_EXECUTABLE) {
 			await turn(request);
 
 			const reason = lastTurnEnd()?.reason;
+			if (mode === 'quota') {
+				assert.equal(reason?.kind, 'error', JSON.stringify(reason));
+				assert.equal(reason.error.code, 'RATE_LIMIT', `the turn must end as a quota error: ${JSON.stringify(reason)}`);
+				assert.match(reason.error.message, /could not be compacted/u);
+				assert.match(reason.error.message, /Resets in 107h16m44s/u);
+				assert.ok(sent.every((bytes) => bytes <= MAX_AGY_PROMPT_BYTES), `a prompt above the ceiling reached the CLI: ${sent.join(', ')}`);
+				assert.equal(summaries.length, 1, 'one summary attempt, no loop');
+				assert.deepEqual(failures, ['ANTIGRAVITY_PROMPT_TOO_LARGE', 'RATE_LIMIT', 'RATE_LIMIT'], 'refusal, failed summary, then the reported cause');
+				return;
+			}
 			assert.equal(reason?.kind, 'completed', `turn failed: ${JSON.stringify(reason)}; warnings=${warnings.join(' | ')}; failures=${failures.join(',')}`);
 			assert.ok(sent.every((bytes) => bytes <= MAX_AGY_PROMPT_BYTES), `a prompt above the ceiling reached the CLI: ${sent.join(', ')}`);
 			assert.equal(failures.length, 1, `exactly one refusal, then a compacted retry: ${failures.join(',')}`);
-			assert.ok(summaries.length >= 1, 'history was summarized');
+			if (mode === 'routed') {
+				assert.equal(summaries.length, 0, 'no summary went to the CLI');
+				assert.equal(routedSummaries.length, 1, 'one summary of the whole history by the chosen model');
+				assert.equal(routedSummaries[0].purpose, 'compaction');
+				assert.equal(routedSummaries[0].maxTokens, 8192, 'output cap lowered to the chosen model');
+				assert.ok(!routedSummaries[0].current, 'the current request entered the summary');
+			} else {
+				assert.ok(summaries.length >= 1, 'history was summarized');
+			}
 			assert.ok(summaries.every((summary) => !summary.current), 'the current request entered a compaction region');
 			const messages = agent.session.deriveMessages();
 			assert.ok(messages.some((message) => message.source?.kind === 'user' && message.content[0]?.text === request), 'current request kept verbatim');

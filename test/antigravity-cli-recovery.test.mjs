@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { activeTailStart, chooseCompactionRange, compactHistoryForAgy, installAgyOverflowRecovery, surfaceBytes } from '../lib/antigravity-cli-recovery.js';
-import { AGY_PROMPT_TOO_LARGE, MAX_AGY_PROMPT_BYTES, estimateMessageBytes } from '../lib/antigravity-cli-local.js';
+import { AGY_PROMPT_TOO_LARGE, MAX_AGY_PROMPT_BYTES, createAgy, estimateMessageBytes } from '../lib/antigravity-cli-local.js';
 
 /** A session double with a positional surface, as compaction-basic sees it. */
 function fakeSession(specs) {
@@ -77,6 +77,31 @@ test('a 450 kB history is summarized oldest-first in spans that each fit the rou
 	assert.ok(surfaceBytes(entries()) <= MAX_AGY_PROMPT_BYTES);
 });
 
+test('with a large-window summarizer the whole history is summarized in one round', async () => {
+	const session = fakeSession([
+		system('Follow the rules.'),
+		user(big('R1')), assistant(big('A1')), user(big('R2')), assistant(big('A2')), user(big('R3')),
+		assistant('short answer'),
+		user('CURRENT REQUEST'), user('runtime facts', 'runtime-context')
+	]);
+	const tail = session.surface.nodes.slice(-2);
+	const compaction = fakeCompaction(session);
+	const rounds = await compactHistoryForAgy({ agent: { session }, compaction, chunkBudget: 1_500_000 });
+	assert.equal(rounds, 1);
+	assert.deepEqual(session.surface.nodes.slice(-2), tail);
+});
+
+test('the listener asks for the summarizer chunk budget of this agent', async () => {
+	const session = fakeSession([user(big('R1')), assistant(big('A1')), user(big('R2')), assistant(big('A2')), user('NOW')]);
+	const compaction = fakeCompaction(session);
+	let handler;
+	const ctx = { on: (_name, fn) => { handler = fn; return () => {}; }, get: (name) => (name === 'compaction' ? compaction : undefined) };
+	installAgyOverflowRecovery(ctx, { chunkBudgetFor: async () => 1_500_000 });
+	const payload = { agent: { session }, turn: 1, step: 1, provider: 'antigravity', failure: { code: AGY_PROMPT_TOO_LARGE }, signal: new AbortController().signal };
+	assert.deepEqual(await handler(payload, async () => 'next'), { kind: 'retry' });
+	assert.equal(compaction.spans.length, 1, 'one summary instead of 180 kB slices');
+});
+
 test('a span never ends between a tool call and its result', () => {
 	const session = fakeSession([
 		user('q'),
@@ -111,6 +136,26 @@ test('the listener handles only this route and this code, once per step', async 
 	assert.equal(await fn({ agent, turn: 1, step: 1, provider: 'antigravity', failure: { code: 'CONTEXT_WINDOW_EXCEEDED' } }, next), 'next');
 	// Ours, but no compaction service: terminal, and never delegated to stock recovery.
 	assert.equal(await fn({ agent, turn: 1, step: 1, provider: 'antigravity', failure: { code: AGY_PROMPT_TOO_LARGE } }, next), undefined);
+});
+
+test('when compaction fails, the turn ends with the real cause instead of "must be compacted"', async () => {
+	const session = fakeSession([user(big('R1')), assistant(big('A1')), user(big('R2')), assistant('a'), user('NOW')]);
+	session.id = 'session-quota';
+	const quota = Object.assign(new Error('Antigravity CLI quota exhausted: Individual quota reached. Resets in 107h16m44s.'), { code: 'RATE_LIMIT' });
+	const compaction = { async compactRegion() { throw quota; } };
+	let handler;
+	const ctx = { on: (_name, fn) => { handler = fn; return () => {}; }, get: (name) => (name === 'compaction' ? compaction : undefined) };
+	installAgyOverflowRecovery(ctx);
+	const payload = { agent: { session }, turn: 1, step: 1, provider: 'antigravity', failure: { code: AGY_PROMPT_TOO_LARGE }, signal: new AbortController().signal };
+	// One retry, so the adapter can report the cause.
+	assert.deepEqual(await handler(payload, async () => 'next'), { kind: 'retry' });
+	const { spawn, calls } = { calls: [], spawn: () => { throw new Error('must not start agy'); } };
+	const agy = createAgy({ spawn, bin: 'agy-under-test', fixOf: () => false });
+	const messages = session.surface.nodes.map((seq) => session.eventAt(seq).message);
+	await assert.rejects(agy.run({ model: 'test', sessionId: 'session-quota', messages }), (error) => error.code === 'RATE_LIMIT' && /could not be compacted/u.test(error.message) && /Resets in 107h16m44s/u.test(error.message));
+	assert.equal(calls.length, 0);
+	// The note is consumed: a later turn gets the normal refusal again.
+	await assert.rejects(agy.run({ model: 'test', sessionId: 'session-quota', messages }), { code: AGY_PROMPT_TOO_LARGE });
 });
 
 test('the listener compacts with the agent\'s own compaction service and retries', async () => {
