@@ -102,6 +102,32 @@ test('the listener asks for the summarizer chunk budget of this agent', async ()
 	assert.equal(compaction.spans.length, 1, 'one summary instead of 180 kB slices');
 });
 
+test('the bridge header is reserved: the history is compacted further so header + surface fit', async () => {
+	const specs = () => [user(big('R1')), assistant(big('A1')), user('R2 '.repeat(50_000)), assistant('a'), user('NOW')];
+	const entriesOf = (session) => session.surface.nodes.map((seq) => ({ seq, event: session.eventAt(seq), message: session.eventAt(seq).message }));
+	const plain = fakeSession(specs());
+	await compactHistoryForAgy({ agent: { session: plain }, compaction: fakeCompaction(plain) });
+	const reserved = fakeSession(specs());
+	await compactHistoryForAgy({ agent: { session: reserved }, compaction: fakeCompaction(reserved), reserveBytes: 30_000 });
+	assert.ok(surfaceBytes(entriesOf(reserved)) + 30_000 <= MAX_AGY_PROMPT_BYTES, `${surfaceBytes(entriesOf(reserved))} + 30000`);
+	assert.ok(surfaceBytes(entriesOf(reserved)) < surfaceBytes(entriesOf(plain)));
+});
+
+test('the listener reserves the bytes the bridge header takes in this session', async () => {
+	const session = fakeSession([user(big('R1')), assistant(big('A1')), user('R2 '.repeat(50_000)), assistant('a'), user('NOW')]);
+	session.id = 'reserve-session';
+	const compaction = fakeCompaction(session);
+	let handler;
+	const ctx = { on: (_name, fn) => { handler = fn; return () => {}; }, get: (name) => (name === 'compaction' ? compaction : undefined) };
+	const asked = [];
+	installAgyOverflowRecovery(ctx, { reserveFor: (agent) => { asked.push(agent.session.id); return 30_000; } });
+	const payload = { agent: { session }, turn: 1, step: 1, provider: 'antigravity', failure: { code: AGY_PROMPT_TOO_LARGE }, signal: new AbortController().signal };
+	assert.deepEqual(await handler(payload, async () => 'next'), { kind: 'retry' });
+	assert.deepEqual(asked, ['reserve-session']);
+	const entries = session.surface.nodes.map((seq) => ({ seq, event: session.eventAt(seq), message: session.eventAt(seq).message }));
+	assert.ok(surfaceBytes(entries) + 30_000 <= MAX_AGY_PROMPT_BYTES);
+});
+
 test('a span never ends between a tool call and its result', () => {
 	const session = fakeSession([
 		user('q'),

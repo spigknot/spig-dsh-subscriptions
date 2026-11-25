@@ -11,6 +11,7 @@ export type SubscriptionTool = 'image_generate' | 'video_generate' | 'x_search' 
 export declare const PROMPT_CACHE_TTLS: readonly ["5m", "1h"];
 export type PromptCacheTtlSetting = typeof PROMPT_CACHE_TTLS[number];
 export type SubagentSpeedTier = 'standard' | 'fast';
+export type AgyTransport = 'compaction' | 'acp';
 export interface AccountPreferences {
     alias?: string;
     /** Absent means included. */
@@ -44,6 +45,10 @@ export interface ProviderPreferences {
     agyFix?: boolean;
     /** Antigravity only: refuse prompts agy would silently truncate and compact the history instead. Absent means on. */
     agyPromptGuard?: boolean;
+    /** Antigravity only: absent keeps the CLI + compaction route. */
+    agyTransport?: AgyTransport;
+    /** Antigravity only: run DSH tools through the tool-calling bridge. Absent means on. */
+    agyToolBridge?: boolean;
     /** Codex only: allow the fast tier (`service_tier: priority`). Absent means off. */
     fastAllowed?: boolean;
 }
@@ -62,10 +67,14 @@ export declare class ProviderSettingsStore {
     subagentSpeed(model: string): SubagentSpeedTier;
     /** The Settings-page Claude cache TTL; undefined follows the plugin config. Read per request, so no clone. */
     promptCacheTtl(): PromptCacheTtlSetting | undefined;
+    /** Opt-in to persistent ACP; existing profiles keep the compaction route. */
+    agyTransport(): AgyTransport;
     /** The Antigravity empty-reply fix; on unless the user turned it off. Read per request, so no clone. */
     agyFix(): boolean;
     /** The Antigravity long-prompt guard; on unless the user turned it off. */
     agyPromptGuard(): boolean;
+    /** The Antigravity DSH tool bridge; on unless the user turned it off. */
+    agyToolBridge(): boolean;
     /** Codex fast tier; off unless the user turned it on in Settings. */
     codexFastAllowed(): boolean;
     /** Creation-time policy survives restarts and never changes an existing session. */
