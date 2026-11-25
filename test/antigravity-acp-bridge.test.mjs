@@ -180,3 +180,33 @@ test('archive pointer instructs the model to use DSH read tool when bridge is ac
 	assert.match(delivered.text, /with the read tool \(file_path, 1-based offset and limit/u);
 	assert.doesNotMatch(delivered.text, /read_file/u);
 });
+
+test('oversized parallel tool results in an incremental ACP step spill to contextDir without breaking the live session', async (t) => {
+	const f = await fixture(t);
+	f.setReply((prompt) => {
+		const tag = tagOf(prompt);
+		return `<${tag}>{"name":"read","arguments":{"file_path":"big.js"}}</${tag}>
+<${tag}>{"name":"read","arguments":{"file_path":"small.js"}}</${tag}>`;
+	});
+	const first = ask('inspect both files');
+	const step1 = await collect(f.transport.stream(f.options([first])));
+	const calls = step1.filter((c) => c.type === 'block-end' && c.block.type === 'tool-call').map((c) => c.block);
+	assert.equal(calls.length, 2);
+	const bigContent = Array.from({ length: 2000 }, (_, i) => `line ${i + 1}: ${'A'.repeat(75)}`).join('\n');
+	const smallContent = 'SMALL-FILE-BODY';
+	const assistant = { role: 'assistant', content: calls };
+	const results = [
+		{ role: 'tool', toolCallId: calls[0].id, content: [{ type: 'text', text: bigContent }] },
+		{ role: 'tool', toolCallId: calls[1].id, content: [{ type: 'text', text: smallContent }] },
+	];
+	f.setReply(() => 'Analyzed both.');
+	const step2 = await collect(f.transport.stream(f.options([first, assistant, ...results])));
+	assert.equal(f.sessions(), 1, 'must stay on the same incremental ACP session');
+	assert.ok(Buffer.byteLength(f.prompts[1], 'utf8') <= 150_000);
+	assert.ok(f.prompts[1].includes(`[id=${calls[1].id}]\nSMALL-FILE-BODY`));
+	assert.match(f.prompts[1], /Full output saved to: ([^\n]+agy-tool-results-[^\s]+\.md) \(lines (\d+)-(\d+)\)/u);
+	const [, savedPath, start, end] = /Full output saved to: ([^\n]+agy-tool-results-[^\s]+\.md) \(lines (\d+)-(\d+)\)/u.exec(f.prompts[1]);
+	const saved = await fs.readFile(savedPath, 'utf8');
+	assert.equal(saved.split('\n').slice(Number(start) - 1, Number(end)).join('\n'), bigContent);
+	assert.equal(step2.at(-1).reason.kind, 'stop');
+});

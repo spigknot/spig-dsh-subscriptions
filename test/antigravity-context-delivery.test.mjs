@@ -127,3 +127,62 @@ test('puts a previous oversized turn in the archive rather than rejecting a type
 	assert.match(text, /read_file.*The last request to retry may be in this archive.*Retry the last request/s);
 	assert.match(await readFile(archivePath, 'utf8'), /original request/);
 });
+
+test('offloads only the largest active tool results in incremental turns, keeping smaller ones inline', async (t) => {
+	const { deliverAcpContext } = await import('../lib/antigravity-context-delivery.js');
+	const contextDir = await tempContext(t);
+	const bigBody = Array.from({ length: 40 }, (_, i) => `big-line-${i + 1}: ${'x'.repeat(40)}`).join('\n');
+	const smallBody = 'SMALL-RESULT-INLINE';
+	const request = { messages: [
+		{ role: 'tool', toolCallId: 'call_big', content: [{ type: 'text', text: bigBody }] },
+		{ role: 'tool', toolCallId: 'call_small', content: [{ type: 'text', text: smallBody }] },
+	] };
+	const bridge = { tag: 'dsh_tc_0123456789ab', header: 'Tool protocol', names: ['read'] };
+	const result = await deliverAcpContext(request, { contextDir, incremental: true, limitBytes: 1200, bridge });
+	assert.ok(result.archivePath && isAbsolute(result.archivePath));
+	assert.ok(Buffer.byteLength(result.text, 'utf8') <= 1200);
+	assert.ok(result.text.includes('[id=call_big]'));
+	assert.ok(result.text.includes('with the read tool'));
+	assert.ok(result.text.includes(result.archivePath));
+	assert.ok(result.text.includes('[id=call_small]\nSMALL-RESULT-INLINE'));
+	assert.ok(!result.text.includes('big-line-40'));
+	const [, start, end] = /lines (\d+)-(\d+)/u.exec(result.text) ?? [];
+	assert.ok(Number(start) > 1 && Number(end) >= Number(start));
+	const saved = await readFile(result.archivePath, 'utf8');
+	const slice = saved.split('\n').slice(Number(start) - 1, Number(end)).join('\n');
+	assert.equal(slice, bigBody);
+});
+
+test('rejects oversized tool results without a broken pointer when writing fails', async (t) => {
+	const { deliverAcpContext } = await import('../lib/antigravity-context-delivery.js');
+	const contextDir = await tempContext(t);
+	const warnings = [];
+	const request = { messages: [{ role: 'tool', toolCallId: 'call_big', content: [{ type: 'text', text: 'z'.repeat(2000) }] }] };
+	const writeFile = () => { throw Object.assign(new Error('denied'), { code: 'EACCES' }); };
+	await assert.rejects(
+		deliverAcpContext(request, { contextDir, incremental: true, limitBytes: 800, writeFile, onWarn: (w) => warnings.push(w) }),
+		{ code: 'INVALID_REQUEST' },
+	);
+	assert.equal(warnings.length, 1);
+	assert.match(warnings[0], /EACCES/);
+});
+
+test('offloads oversized active tool results and still archives old history on non-incremental turns', async (t) => {
+	const { deliverAcpContext } = await import('../lib/antigravity-context-delivery.js');
+	const contextDir = await tempContext(t);
+	const toolCall = { type: 'tool-call', id: 'call_big', name: 'read', arguments: '{}' };
+	const bigBody = Array.from({ length: 60 }, (_, i) => `row-${i + 1}: ${'y'.repeat(30)}`).join('\n');
+	const request = { messages: [
+		user('old turn '.repeat(120)),
+		assistant('old answer'),
+		user('inspect file'),
+		assistant([{ type: 'text', text: 'Reading.' }, toolCall]),
+		{ role: 'tool', toolCallId: 'call_big', content: [{ type: 'text', text: bigBody }] },
+	] };
+	const bridge = { tag: 'dsh_tc_0123456789ab', header: 'Tool protocol', names: ['read'] };
+	const result = await deliverAcpContext(request, { contextDir, limitBytes: 1500, bridge });
+	assert.ok(Buffer.byteLength(result.text, 'utf8') <= 1500);
+	assert.ok(result.archivePath && result.toolArchivePath);
+	assert.match(await readFile(result.archivePath, 'utf8'), /old answer/);
+	assert.match(await readFile(result.toolArchivePath, 'utf8'), /row-60:/);
+});
