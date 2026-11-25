@@ -42,6 +42,10 @@ export interface ProviderPreferences {
      * the shell granted the model can end a turn with an empty reply.
      */
     agyFix?: boolean;
+    /** Antigravity only: refuse prompts agy would silently truncate and compact the history instead. Absent means on. */
+    agyPromptGuard?: boolean;
+    /** Codex only: allow the fast tier (`service_tier: priority`). Absent means off. */
+    fastAllowed?: boolean;
 }
 export declare function validatePreferences(provider: ProviderId, input: unknown): ProviderPreferences;
 /** Durable user preferences, independent of expiring discovery caches. */
@@ -60,6 +64,10 @@ export declare class ProviderSettingsStore {
     promptCacheTtl(): PromptCacheTtlSetting | undefined;
     /** The Antigravity empty-reply fix; on unless the user turned it off. Read per request, so no clone. */
     agyFix(): boolean;
+    /** The Antigravity long-prompt guard; on unless the user turned it off. */
+    agyPromptGuard(): boolean;
+    /** Codex fast tier; off unless the user turned it on in Settings. */
+    codexFastAllowed(): boolean;
     /** Creation-time policy survives restarts and never changes an existing session. */
     toolEnabled(provider: ProviderId, tool: SubscriptionTool, createdAt?: number): boolean;
     set(provider: ProviderId, input: unknown): Promise<void>;

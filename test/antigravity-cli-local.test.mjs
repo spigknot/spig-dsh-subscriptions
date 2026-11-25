@@ -185,7 +185,8 @@ test('a session workspace becomes the CLI cwd and is registered with --add-dir',
 });
 
 test('a prompt far past the Windows command-line cap is still delivered', async () => {
-	const longText = 'x'.repeat(5 * 1024 * 1024);
+	// ~4x the ~32 KB argv cap, yet under the route's prompt ceiling.
+	const longText = 'x'.repeat(128 * 1024);
 	let seen = '';
 	const { spawn, calls } = fakeSpawn(({ stdout, child }) => {
 		stdout.end('{"event":"result","result":{"status":"SUCCESS","response":"ok"}}\n');
@@ -292,6 +293,65 @@ test('the opt-in journal records what was sent and what came back', async () => 
 	}
 });
 
+test('oversized history raises DSH context overflow without launching the CLI', async () => {
+	const { spawn, calls } = fakeSpawn(({ stdout, child }) => {
+		stdout.end('{"event":"result","result":{"status":"SUCCESS","response":"stale topic"}}\n');
+		child.emit('close', 0);
+	});
+	const agy = createAgy({ spawn, bin: 'agy-under-test', fixOf: () => false });
+	await assert.rejects(agy.run({ model: 'test', messages: [
+		{ role: 'user', content: 'q' },
+		{ role: 'assistant', content: 'ó'.repeat(100_000) },
+		{ role: 'user', content: 'pedido atual' }
+	] }), { code: 'ANTIGRAVITY_PROMPT_TOO_LARGE' });
+	assert.equal(calls.length, 0);
+});
+
+test('with the long-prompt guard off the route sends everything, as before', async () => {
+	const { spawn, calls } = fakeSpawn(({ stdout, child }) => {
+		stdout.end('{"event":"result","result":{"status":"SUCCESS","response":"ok"}}\n');
+		child.emit('close', 0);
+	});
+	const agy = createAgy({ spawn, bin: 'agy-under-test', fixOf: () => false, guardOf: () => false });
+	const text = 'x'.repeat(250_000);
+	await agy.run({ model: 'test', messages: [{ role: 'user', content: 'q' }, { role: 'assistant', content: 'a' }, { role: 'user', content: text }] });
+	assert.equal(calls.length, 1);
+	assert.ok(JSON.parse(calls[0].stdin.trim()).message.content[0].text.endsWith(text));
+});
+
+test('a prompt exactly at the ceiling is sent whole', async () => {
+	const { spawn, calls } = fakeSpawn(({ stdout, child }) => {
+		stdout.end('{"event":"result","result":{"status":"SUCCESS","response":"ok"}}\n');
+		child.emit('close', 0);
+	});
+	const agy = createAgy({ spawn, bin: 'agy-under-test', fixOf: () => false });
+	const text = 'x'.repeat(180_000 - 2) + 'é';
+	assert.equal(Buffer.byteLength(text, 'utf8'), 180_000);
+	await agy.run({ model: 'test', messages: [{ role: 'user', content: text }] });
+	assert.equal(JSON.parse(calls[0].stdin.trim()).message.content[0].text, text);
+});
+
+test('a non-compactable oversized request fails with INVALID_REQUEST before spawn', async () => {
+	const { spawn, calls } = fakeSpawn(() => {});
+	const agy = createAgy({ spawn, bin: 'agy-under-test', fixOf: () => false });
+	await assert.rejects(agy.run({ model: 'test', messages: [
+		{ role: 'user', content: 'q' },
+		{ role: 'assistant', content: 'a' },
+		{ role: 'user', content: 'é'.repeat(90_001) }
+	] }), { code: 'INVALID_REQUEST', message: /current request with its instructions alone/u });
+	assert.equal(calls.length, 0);
+});
+
+test('oversized auxiliary compaction input fails without requesting another compaction', async () => {
+	const { spawn, calls } = fakeSpawn(() => {});
+	const agy = createAgy({ spawn, bin: 'agy-under-test', fixOf: () => false });
+	await assert.rejects(agy.run({ model: 'test', purpose: 'compaction', messages: [
+		{ role: 'user', content: 'x'.repeat(180_000) },
+		{ role: 'user', content: 'summarize this region' }
+	] }), { code: 'INVALID_REQUEST', message: /summariz/u });
+	assert.equal(calls.length, 0);
+});
+
 test('without the switch the journal stays silent', async () => {
 	const log = join(tmpdir(), `dsh-agy-test-off-${Date.now()}.log`);
 	const { spawn } = fakeSpawn(({ stdout, child }) => {
@@ -308,56 +368,96 @@ test('without the switch the journal stays silent', async () => {
 });
 
 
-test('harness metadata never becomes the last user turn', () => {
+test('real user text starting with reminder markup is preserved in full', () => {
+	const prompt = buildPrompt({ messages: [
+		{ role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '<system-reminder>quoted</system-reminder>' }, { type: 'text', text: 'NEW_REQUEST' }] },
+		{ role: 'user', source: { kind: 'runtime-context' }, content: 'live runtime facts' },
+		{ role: 'user', source: { kind: 'time-context' }, content: 'sampled time' },
+		{ role: 'user', source: { kind: 'model-selection', form: 'notice' }, content: 'route notice' }
+	] });
+	assert.match(prompt, /<system-reminder>quoted<\/system-reminder>\nNEW_REQUEST$/u);
+	// Context admitted with the request stays visible, but ahead of it.
+	for (const context of ['live runtime facts', 'sampled time', 'route notice']) {
+		assert.ok(prompt.indexOf(context) !== -1 && prompt.indexOf(context) < prompt.indexOf('NEW_REQUEST'), context);
+	}
+});
+
+test('a system head is labelled as system, not as a user turn', () => {
+	const prompt = buildPrompt({ messages: [
+		{ role: 'system', source: { kind: 'system-prompt' }, content: 'BE BRIEF' },
+		{ role: 'user', source: { kind: 'user' }, content: 'q' }
+	] });
+	assert.equal(prompt, 'System: BE BRIEF\n\nUser: q');
+});
+
+test('a whitespace-only current request does not fall back to an older user message', () => {
+	assert.throws(() => buildPrompt({ messages: [
+		{ role: 'user', source: { kind: 'user' }, content: 'old question' },
+		{ role: 'user', source: { kind: 'user' }, content: '  ' },
+		{ role: 'user', source: { kind: 'time-context' }, content: 'sampled time' }
+	] }), { code: 'EMPTY_REQUEST' });
+});
+
+test('a projected attachment alone remains the actual request', () => {
+	const ref = 'Attached file: NEW.md (123 bytes, sha256:12345678)';
+	assert.ok(buildPrompt({ messages: [
+		{ role: 'user', source: { kind: 'user' }, content: ref },
+		{ role: 'user', source: { kind: 'time-context' }, content: 'sampled time' }
+	] }).endsWith(ref));
+});
+
+test('a typed retry becomes an explicit continuation', () => {
+	assert.match(buildPrompt({ messages: [
+		{ role: 'user', source: { kind: 'user' }, content: 'request to resume' },
+		{ role: 'assistant', content: 'partial answer' },
+		{ role: 'user', source: { kind: 'retry' }, content: [] }
+	] }), /retry the last request/iu);
+});
+
+test('context admitted after the request never takes its place at the end', () => {
 	const prompt = buildPrompt({
 		messages: [
-			{ role: 'user', content: [{ type: 'text', text: 'relatorio da R38 anexado' }] },
-			{ role: 'assistant', content: [{ type: 'text', text: 'li o relatorio' }] },
-			{ role: 'user', content: [{ type: 'text', text: 'Time sampled while preparing turn 59, step 1: 2026-11-24T18:38:07-03:00' }] },
-			{ role: 'user', content: [{ type: 'text', text: '[model changed: assistant turns above this point were generated by gemini-4-argon; the session continues with gemini-4-hydrogen]' }] },
-			{ role: 'user', content: [{ type: 'text', text: 'gere o prompt da R39' }] }
+			{ role: 'user', source: { kind: 'user' }, content: 'relatorio da R38 anexado' },
+			{ role: 'assistant', content: 'li o relatorio' },
+			{ role: 'user', source: { kind: 'user' }, content: 'gere o prompt da R39' },
+			{ role: 'user', source: { kind: 'time-context' }, content: 'Time sampled while preparing turn 59, step 1' },
+			{ role: 'user', source: { kind: 'model-selection', form: 'notice' }, content: '[model changed: gemini-4-argon -> gemini-4-hydrogen]' }
 		]
 	});
-	assert.doesNotMatch(prompt, /model changed/u);
-	assert.doesNotMatch(prompt, /Time sampled/u);
-	// The request must be the tail: that is the whole point of dropping the metadata.
-	assert.match(prompt, /gere o prompt da R39$/u);
+	assert.match(prompt, /User: gere o prompt da R39$/u);
+	assert.ok(prompt.indexOf('model changed') < prompt.indexOf('gere o prompt da R39'));
 });
 
-test('a request made only of metadata still fails closed', () => {
-	assert.throws(
-		() => buildPrompt({ messages: [{ role: 'user', content: [{ type: 'text', text: '[model changed: a -> b]' }] }] }),
-		(error) => error.code === 'EMPTY_REQUEST'
-	);
-});
-
-test('an attachment-only turn fails loudly instead of answering the history', () => {
-	// What the CLI route actually receives when the user sends a report and no text:
-	// the attachment block never arrives (inputModalities is text-only) and what is
-	// left is harness metadata. Guessing from history produced answers about rounds
-	// ten turns old, so this must be an explicit failure.
+test('only harness context after the last answer fails closed instead of answering the history', () => {
+	// Without a request after the last answer the model would continue an older
+	// round; that must be an explicit failure, never a guess.
 	assert.throws(
 		() => buildPrompt({
 			messages: [
-				{ role: 'user', content: [{ type: 'text', text: 'relatorio da R30 anexado' }] },
-				{ role: 'assistant', content: [{ type: 'text', text: 'parecer da R30' }] },
-				{ role: 'user', content: [{ type: 'text', text: '<system-reminder> The available skill catalog changed.' }] },
-				{ role: 'user', content: [{ type: 'text', text: 'Time sampled while preparing turn 59, step 1: 2026-11-24T18:38:07-03:00' }] },
-				{ role: 'user', content: [{ type: 'text', text: '[model changed: gemini-4-argon; continues with gemini-4-neon]' }] }
+				{ role: 'user', source: { kind: 'user' }, content: 'relatorio da R30 anexado' },
+				{ role: 'assistant', content: 'parecer da R30' },
+				{ role: 'user', source: { kind: 'skill-catalog' }, content: '<available_skills>…</available_skills>' },
+				{ role: 'user', source: { kind: 'time-context' }, content: 'Time sampled while preparing turn 59, step 1' },
+				{ role: 'user', source: { kind: 'model-selection', form: 'notice' }, content: '[model changed: gemini-4-argon -> gemini-4-neon]' }
 			]
 		}),
 		(error) => error.code === 'EMPTY_REQUEST'
 	);
 });
 
-test('a real request after an attachment still goes through', () => {
-	const prompt = buildPrompt({
-		messages: [
-			{ role: 'user', content: [{ type: 'text', text: '<system-reminder> skill catalog' }] },
-			{ role: 'user', content: [{ type: 'text', text: 'Segue o relatorio da R38; gere a R39' }] }
-		]
-	});
-	assert.match(prompt, /gere a R39$/u);
-	assert.doesNotMatch(prompt, /skill catalog/u);
+test('a lone model-switch notice is not a request', () => {
+	assert.throws(
+		() => buildPrompt({ messages: [{ role: 'user', source: { kind: 'model-selection', form: 'notice' }, content: '[model changed: a -> b]' }] }),
+		(error) => error.code === 'EMPTY_REQUEST'
+	);
+});
+
+test('tool results after the last answer continue the task instead of failing', () => {
+	const prompt = buildPrompt({ messages: [
+		{ role: 'user', source: { kind: 'user' }, content: 'list the files' },
+		{ role: 'assistant', content: [{ type: 'tool-call', id: 't1', name: 'ls', arguments: '{}' }] },
+		{ role: 'tool', content: [{ type: 'tool-result', content: [{ type: 'text', text: 'a.txt' }] }] }
+	] });
+	assert.match(prompt, /Tool result: a\.txt\n\nUser: Continue the task/u);
 });
 

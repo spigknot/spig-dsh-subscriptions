@@ -57,6 +57,36 @@ test('the toggle reads agyFix from the bundled store, not the unused file', () =
 	assert.match(bundledClassBody(), /agyFix\(\)\s*\{[^}]*agyFix !== false/u);
 });
 
+test('the long-prompt guard defaults on and the Codex fast tier defaults off', () => {
+	const body = bundledClassBody();
+	assert.match(body, /agyPromptGuard\(\)\s*\{[^}]*agyPromptGuard !== false/u, 'absent guard must mean on');
+	assert.match(body, /codexFastAllowed\(\)\s*\{[^}]*fastAllowed === true/u, 'absent permission must mean off');
+});
+
+test('every path to the Codex fast tier passes the Settings gate', () => {
+	// The request itself: nothing else can put service_tier: priority on the wire.
+	assert.match(bundle, /speedFor: \(sessionId, model\) => preferences\.codexFastAllowed\(\) &&/u);
+	// The composer state: no fast-capable model is offered while disabled.
+	assert.match(bundle, /async speed\(sessionId, model\) \{\s*(?:\/\/[^\n]*\n\s*)?if \(!preferences\.codexFastAllowed\(\)\) return \{\s*tier: "standard",\s*fastModels: \[\]/u);
+	// Saving a fast choice is refused while disabled.
+	assert.match(bundle, /async setSpeed\(sessionId, tier, model\) \{\s*if \(tier === "fast" && !preferences\.codexFastAllowed\(\)\) throw/u);
+	// The settings catalog does not offer fast for subagents while disabled.
+	assert.match(bundle, /fastTier: preferences\.codexFastAllowed\(\) &&/u);
+	// service_tier is only ever written from that gated flag (comment lines aside).
+	const writes = bundle.split('\n').filter((line) => /\bservice_tier\b/u.test(line) && !/^\s*(?:\*|\/\/)/u.test(line));
+	assert.deepEqual(writes.map((line) => line.trim()), ['...fast ? { service_tier: CODEX_FAST_SERVICE_TIER } : {}']);
+});
+
+test('toggles merge into the stored provider document instead of replacing it', () => {
+	// `set` replaces the whole document; spreading the async `get` used to wipe
+	// the display name and visible models on the first toggle.
+	assert.doesNotMatch(bundle, /\.\.\.providerSettings\.get\(/u);
+	assert.match(bundle, /async patch\(provider, partial\) \{\s*await this\.set\(provider, \{\s*\.\.\.preferences\.get\(provider\),\s*\.\.\.partial/u);
+	for (const endpoint of ['setAgyFix', 'setAgyPromptGuard', 'setCodexFast']) {
+		assert.match(bundle, new RegExp(`"${endpoint}",`, 'u'), `${endpoint} must be a registered endpoint`);
+	}
+});
+
 test('standalone provider-settings.js does not drift from the bundled copy', () => {
 	// Nothing imports it, so it must not pretend to own a method the bundle lacks.
 	const standalone = readFileSync(new URL('provider-settings.js', root), 'utf8');
