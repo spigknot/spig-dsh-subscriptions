@@ -200,3 +200,20 @@ test('the listener compacts with the agent\'s own compaction service and retries
 	// A second refusal in the same step is terminal: no compaction loop.
 	assert.equal(await handler(payload, async () => 'next'), undefined);
 });
+
+test('recovery reserves a large options.system outside the surface so a refusal never returns 0 rounds', async () => {
+	// Surface alone is ~152 kB (below 180 kB), but options.system adds ~38 kB -> ~190 kB total.
+	const session = fakeSession([user('a'.repeat(80_000)), assistant('a1'), user('b'.repeat(70_000)), assistant('a2'), user('NOW')]);
+	session.id = 'session-big-system';
+	const agy = createAgy({ spawn: () => { throw new Error('must not start agy'); }, bin: 'agy-under-test', fixOf: () => false, bridgeOf: () => false });
+	const messages = session.surface.nodes.map((seq) => session.eventAt(seq).message);
+	const bigSystem = 'S'.repeat(38_000);
+	await assert.rejects(agy.run({ model: 'test', sessionId: session.id, messages, system: bigSystem }), { code: AGY_PROMPT_TOO_LARGE });
+	const compaction = fakeCompaction(session);
+	let handler;
+	const ctx = { on: (_name, fn) => { handler = fn; return () => {}; }, get: (name) => (name === 'compaction' ? compaction : undefined) };
+	installAgyOverflowRecovery(ctx);
+	const payload = { agent: { session }, turn: 35, step: 16, provider: 'antigravity', failure: { code: AGY_PROMPT_TOO_LARGE }, signal: new AbortController().signal };
+	assert.deepEqual(await handler(payload, async () => 'next'), { kind: 'retry' });
+	assert.ok(compaction.spans.length >= 1, 'expected compaction to run when options.system pushed prompt over 180 kB');
+});

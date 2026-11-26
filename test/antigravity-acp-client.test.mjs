@@ -65,10 +65,18 @@ test('handshakes over NDJSON v1 in private cwd with explicit sandbox flags and n
 	assert.equal(fx.kills, 0);
 });
 
-test('rejects unverified CLI versions even when the protocol matches', async (t) => {
-	const fx = fake(t, (request, io) => io.reply(request, { ...initResult, agentInfo: { version: '1.5.18' } }));
-	await assert.rejects(fx.client.initialize(), { code: 'ACP_TRANSPORT' });
-	assert.equal(fx.client.alive, false);
+test('accepts verified 1.x CLI versions >= 1.5.17 and rejects older, major-bumped, or malformed versions', async (t) => {
+	for (const version of ['1.5.17', '1.5.18', '1.6.0', '1.5.18-beta.1']) {
+		const fx = fake(t, (request, io) => io.reply(request, { ...initResult, agentInfo: { ...initResult.agentInfo, version } }));
+		await fx.client.initialize();
+		assert.equal(fx.client.alive, true, `expected ${version} to be accepted`);
+		await fx.client.dispose();
+	}
+	for (const version of ['1.5.16', '1.4.99', '2.0.0', '0.9.0', '', undefined]) {
+		const fx = fake(t, (request, io) => io.reply(request, { ...initResult, agentInfo: { ...initResult.agentInfo, version } }));
+		await assert.rejects(fx.client.initialize(), { code: 'ACP_TRANSPORT' }, `expected ${String(version)} to be rejected`);
+		assert.equal(fx.client.alive, false);
+	}
 });
 
 function withInit(handler) {
