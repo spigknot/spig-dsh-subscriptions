@@ -220,7 +220,7 @@ Existing defaults continue to load from and save to `~/.dsh/plugins/subscription
     claudeDeferTools: []               # Claude: tool-name patterns sent deferred (see below); empty = unchanged request
     rateLimit:
       wait: true                       # wait out a closed rate-limit window (default)
-      maxWaitMs: 21600000              # ceiling on one wait; 6 h, covers a 5-hour session window
+      maxWaitMs: 120000                # ceiling on one wait; default 2 min — a reset further out fails the turn with the reset time instead of parking the session (set 21600000 to wait out a full 5-hour session window)
     models:                            # override the discovered/built-in catalogs
       codex:
         - { id: gpt-5.6-sol, name: GPT-5.6 Sol, contextWindow: 272000, inputModalities: [text, image] }
@@ -349,12 +349,12 @@ Waiting on that reported delay is executed by [`@deepseek-ai/dsh-llm-retry`](htt
   config:
     rateLimit:
       wait: true            # default; false keeps the previous seconds-scale behaviour
-      maxWaitMs: 21600000   # 6 h — covers a 5-hour session window with slack
+      maxWaitMs: 120000     # default 2 min — set 21600000 (6 h) to wait out a full 5-hour session window again
 ```
 
-A reset further out than `maxWaitMs` — a weekly window days away, or a whole pool cooling down past it — fails the turn immediately with the reset time attached, rather than parking the session for days. `wait: false` drops back to local backoff alone.
+A reset further out than `maxWaitMs` — a weekly window days away, or a whole pool cooling down past it — fails the turn immediately with the reset time attached, rather than parking the session for days. `wait: false` drops back to local backoff alone. The 2-minute default is deliberate: a quota reset hours out (e.g. a session window recovers in 4 h) ends the turn at once with the recovery time in the message, so the user can switch model/account or wait by hand instead of watching a parked `Retrying model request (1/10)` countdown the stop button cannot reliably abort.
 
-All five routes share Claude Code's own retry shape: ten retries after the first attempt, backing off from 1 s with 20% jitter under a 60 s cap. These are consumer subscription endpoints that shed load in bursts, and the dsh-llm defaults (five retries from 500 ms to 10 s) give up after about fifteen seconds, which is short for that. A 429 that discloses no reset is now retried locally for roughly 17 minutes before the turn fails — about 5 minutes with `wait: false`, where the 60 s cap actually binds. Copilot currently uses the generic `retry-after` signal; unrecognized GitHub rate-limit headers are surfaced through the plugin warning sink for a future provider-specific reader.
+All five routes share Claude Code's own retry shape: ten retries after the first attempt, backing off from 1 s with 20% jitter under a 60 s cap. These are consumer subscription endpoints that shed load in bursts, and the dsh-llm defaults (five retries from 500 ms to 10 s) give up after about fifteen seconds, which is short for that. A 429 that discloses no reset is now retried locally for roughly 8 minutes before the turn fails — about 5 minutes with `wait: false`, where the 60 s cap actually binds. Copilot currently uses the generic `retry-after` signal; unrecognized GitHub rate-limit headers are surfaced through the plugin warning sink for a future provider-specific reader.
 
 One trade-off worth knowing: the delay ceiling is shared with that local backoff, so raising `maxWaitMs` also raises how long an unrelated transient failure (`TRANSPORT`, `SERVER`, `TIMEOUT`) can back off for before the finite retry budget runs out — up to 512 s on the last of the ten retries instead of the 60 s cap.
 
